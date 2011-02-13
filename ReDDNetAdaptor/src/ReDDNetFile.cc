@@ -6,6 +6,10 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <dlfcn.h>
+
+pthread_mutex_t ReDDNetFile::m_dlopen_lock = PTHREAD_MUTEX_INITIALIZER;
+
 
 ReDDNetFile::ReDDNetFile (void)
   : m_fd (NULL),
@@ -15,7 +19,7 @@ ReDDNetFile::ReDDNetFile (void)
 	loadLibrary();	
 }
 
-ReDDNetFile::ReDDNetFile (IOFD fd)
+ReDDNetFile::ReDDNetFile (void * fd)
   : m_fd (fd),
     m_close (true),
 	m_is_loaded(false)
@@ -50,48 +54,80 @@ ReDDNetFile::~ReDDNetFile (void)
   closeLibrary();
 }
 
+//	NAME = static_cast<TYPE>(dlsym(m_library_handle, #NAME));
+
 #define REDD_LOAD_SYMBOL( NAME, TYPE ) 	dlerror();\
-	NAME = (TYPE)dlsym(library_handle, #NAME);\
-	if ( retval = dlerror() ) {\
+	NAME = reinterpret_cast<TYPE>(dlsym(m_library_handle, #NAME));\
+	if ( (retval = dlerror()) ) {\
 		throw cms::Exception("ReDDNetFile::loadLibrary()") <<\
 			"Failed to load dlsym ReDDNet library: " << retval;\
 	}\
-	if (bootstrap_bfs == NULL) {\
+	if ( NAME == NULL) {\
 		throw cms::Exception("ReDDNetFile::loadLibrary()") <<\
 			"Got a null pointer back from dlsym()\n";\
 	}
 
 void ReDDNetFile::loadLibrary() {
-	ReDDNetFile::MutexWrapper( &m_dlopen_lock );
+	
+	//pthread_mutex_t ReDDNetFile::m_dlopen_lock = PTHREAD_MUTEX_INITIALIZER;
+
+	ReDDNetFile::MutexWrapper lockObj( & this->m_dlopen_lock );
 	// until ACCRE removes the java dependency from their client libs,
 	// we'll dlopen() them so they don't need to be brought along with cmssw
 	// if you're running ReDDNet at your site, you will have the libs anyway
 	// TODO add wrappers to make this work in OSX as well (CMSSW's getting ported?)
-	library_handle =
+	m_library_handle =
 	     dlopen("libreddnet.so", RTLD_LAZY);
-	if (library_handle == NULL) {
+	if (m_library_handle == NULL) {
 		throw cms::Exception("ReDDNetFile::loadLibrary()")
-			<< "Can't dlopen() ReDDNet libraries";
+			<< "Can't dlopen() ReDDNet libraries: " << dlerror();
 	}
 	char * retval;
-	REDD_LOAD_SYMBOL( int(*)(), redd_init ); 
-//    bool m_is_loaded;
-//	int (*redd_init)();
-//	    ssize_t (*redd_read)(int, char*, ssize_t);
-//		  int (*redd_close)(void *);
-//		    off_t (*redd_lseek64)(void *, off_t, int);
-//			  void * (*redd_open)( char *, int, int )
-//			    ssize_t (*redd_write)(int, const char *, ssize_t);
-//				  int (*redd_term)();
-//				    long (*redd_errno)();
-//					  const std::string & (*redd_strerror)();
+	REDD_LOAD_SYMBOL( redd_init, int(*)()); 
+	REDD_LOAD_SYMBOL( redd_read, ssize_t(*)(void *, char*, ssize_t));
+	REDD_LOAD_SYMBOL( redd_lseek64, off_t(*)(void*, off_t, int));
+	REDD_LOAD_SYMBOL( redd_open, void*(*)(const char*,int,int));
+	REDD_LOAD_SYMBOL( redd_write, ssize_t(*)(void *, const char *, ssize_t));
+	REDD_LOAD_SYMBOL( redd_term, int(*)());
+	REDD_LOAD_SYMBOL( redd_errno, long(*)());
+	REDD_LOAD_SYMBOL( redd_strerror, const std::string & (*)(long));
 
-//	pthread_mutex_unlock(&init_mutex);
-//	} catch 
+	if ( (*redd_init)() ) {
+		throw cms::Exception("ReDDNetFile::loadLibrary()")
+			<< "Error in redd_init: " << (*redd_strerror)(0);
+	}
+	m_is_loaded = true;
+
 }
 
 void ReDDNetFile::closeLibrary() {
-
+	// this is dumb syntax for a static member variable, but 
+	// gcc was being even dumber, so I went this way
+	try {
+		ReDDNetFile::MutexWrapper lockObj( & this->m_dlopen_lock );
+			// congrats. pthread_mutex_lock failed and we're in a destructor.
+			// for as much as I like RAII, I don't know what to do here
+			// Then again, if the mutex is jammed, things are already boned
+			// Cry for a second, then continue with life, I guess
+			// melo
+			
+		if ( m_is_loaded ) {
+			if ( (*redd_term)() ) {
+				throw cms::Exception("ReDDNetFile::closeLibrary()")
+					<< "Error in redd_term: " << (*redd_strerror)(0);
+			}
+		}
+		if ( m_library_handle != NULL ) {
+			if ( dlclose( m_library_handle ) ) {
+				throw cms::Exception("ReDDNetFile::closeLibrary()")
+					<< "Error on dlclose(): " << dlerror();
+			}
+		}
+	} catch (cms::Exception & e) {
+		edm::LogError("ReDDNetFileError")
+	      << "ReDDNetFile had an error in its destructor: " << e;
+	}
+	m_is_loaded = false;
 }
 
 
@@ -170,14 +206,13 @@ ReDDNetFile::open (const char *name,
     openflags |= O_TRUNC;
 
   void * newfd = NULL;
-  redd_errno = 0;
-  if ((newfd = (*redd_open) (name, openflags, perms)) == -1)
+  if ((newfd = (*redd_open) (name, openflags, perms)) == NULL)
     throw cms::Exception("ReDDNetFile::open()")
       << "redd_open(name='" << name
       << "', flags=0x" << std::hex << openflags
       << ", permissions=0" << std::oct << perms << std::dec
-      << ") => error '" << redd_strerror(redd_errno)
-      << "' (redd_errno=" << redd_errno << ")";
+      << ") => error '" << (*redd_strerror)((*redd_errno)())
+      << "' (redd_errno=" << (*redd_errno)() << ")";
 
   m_fd = newfd;
 
@@ -231,7 +266,7 @@ ReDDNetFile::read (void *into, IOSize n)
     if (s == -1)
       throw cms::Exception("ReDDNetFile::read()")
         << "redd_read(name='" << m_name << "', n=" << (n-done)
-        << ") failed with error '" << (*redd_strerror)((*redd_errno()))
+        << ") failed with error '" << (*redd_strerror)((*redd_errno)())
         << "' (redd_errno=" << (*redd_errno)() << ")";
     else if (s == 0)
       // end of file
@@ -252,7 +287,7 @@ ReDDNetFile::write (const void *from, IOSize n)
     if (s == -1)
       throw cms::Exception("ReDDNetFile::write()")
         << "redd_write(name='" << m_name << "', n=" << (n-done)
-        << ") failed with error '" << (*redd_strerror)((*redd_errno()))
+        << ") failed with error '" << (*redd_strerror)((*redd_errno)())
         << "' (redd_errno=" << (*redd_errno)() << ")";
     done += s;
   }
@@ -277,12 +312,11 @@ ReDDNetFile::position (IOOffset offset, Relative whence /* = SET */)
 		    	    : whence == CURRENT ? SEEK_CUR
 			    : SEEK_END);
 
-  redd_errno = 0;
-  if ((result = (*redd_lseek) (m_fd, offset, mywhence)) == -1)
+  if ((result = (*redd_lseek64) (m_fd, offset, mywhence)) == -1)
     throw cms::Exception("ReDDNetFile::position()")
       << "redd_lseek64(name='" << m_name << "', offset=" << offset
       << ", whence=" << mywhence << ") failed with error '"
-      << (*redd_strerror) ((*redd_errno)()) << "' (redd_errno=" << (*redd_errno()) << ")";
+      << (*redd_strerror) ((*redd_errno)()) << "' (redd_errno=" << (*redd_errno)() << ")";
 
   // FIXME: dCache returns incorrect value on SEEK_END.
   // Remove this hack when dcap has been fixed.
@@ -318,7 +352,6 @@ ReDDNetFile::MutexWrapper::~MutexWrapper()
     	// melo
 		edm::LogError("ReDDNetFileError")
 	      << "ReDDNetFile couldn't unlock a mutex";
-
 	}
 }
 	

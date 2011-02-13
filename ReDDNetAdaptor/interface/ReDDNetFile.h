@@ -4,12 +4,12 @@
 # include "Utilities/StorageFactory/interface/Storage.h"
 # include "Utilities/StorageFactory/interface/IOFlags.h"
 # include <string>
-
+#include <pthread.h>
 class ReDDNetFile : public Storage
 {
 public:
   ReDDNetFile (void);
-  ReDDNetFile (IOFD fd);
+  ReDDNetFile (void * fd);
   ReDDNetFile (const char *name, int flags = IOFlags::OpenRead, int perms = 0666);
   ReDDNetFile (const std::string &name, int flags = IOFlags::OpenRead, int perms = 0666);
   ~ReDDNetFile (void);
@@ -39,28 +39,33 @@ public:
 
   virtual void		close (void);
   virtual void		abort (void);
+  
   class MutexWrapper {
+	public:
 	  MutexWrapper( pthread_mutex_t * lock );
 	  ~MutexWrapper();
-  }
+	  pthread_mutex_t * m_lock;
+  };
+
+  static pthread_mutex_t m_dlopen_lock;
+
 private:
   void *		m_fd;
   bool			m_close;
   std::string		m_name;
   void loadLibrary();
   void closeLibrary();
-  static pthread_mutex_t m_dlopen_lock = PTHREAD_MUTEX_INITIALIZER;
   void * m_library_handle;
   bool m_is_loaded;
   int (*redd_init)();
-  ssize_t (*redd_read)(int, char*, ssize_t); 
+  ssize_t (*redd_read)(void *, char*, ssize_t); 
   int (*redd_close)(void *);
   off_t (*redd_lseek64)(void *, off_t, int);
-  void * (*redd_open)( char *, int, int )
-  ssize_t (*redd_write)(int, const char *, ssize_t);
+  void * (*redd_open)(const char *, int, int );
+  ssize_t (*redd_write)(void *, const char *, ssize_t);
   int (*redd_term)();
   long (*redd_errno)();
-  const std::string & (*redd_strerror)();
+  const std::string & (*redd_strerror)(long);
 };
 
 #endif // REDDNET_ADAPTOR_REDDNET_FILE_H
